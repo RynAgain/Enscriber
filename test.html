@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Enscriber Test Page</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 40px;
+            line-height: 1.6;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        .button {
+            background: #007bff;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 10px;
+        }
+        .card {
+            border: 1px solid #ddd;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .form-group {
+            margin: 15px 0;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        .form-group input {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Enscriber Element Selection Test</h1>
+        <p>This page is for testing the Enscriber element selection and highlighting system.</p>
+        
+        <div class="card">
+            <h2>Sample Form</h2>
+            <div class="form-group">
+                <label for="name">Name:</label>
+                <input type="text" id="name" name="name" placeholder="Enter your name">
+            </div>
+            <div class="form-group">
+                <label for="email">Email:</label>
+                <input type="email" id="email" name="email" placeholder="Enter your email">
+            </div>
+            <button class="button" onclick="alert('Button clicked!')">Submit</button>
+        </div>
+        
+        <div class="card">
+            <h2>Navigation Links</h2>
+            <a href="#home">Home</a> |
+            <a href="#about">About</a> |
+            <a href="#contact">Contact</a>
+        </div>
+        
+        <div class="card">
+            <h2>List Items</h2>
+            <ul>
+                <li>First item</li>
+                <li>Second item</li>
+                <li>Third item</li>
+            </ul>
+        </div>
+    </div>
+
+    <script>
+        // Extract the Enscriber code from the userscript and run it directly
+        // This simulates the Tampermonkey environment for testing
+        (function() {
+            'use strict';
+
+            // Mock GM functions for testing
+            window.GM_setValue = function(key, value) {
+                localStorage.setItem('enscriber_' + key, value);
+            };
+            window.GM_getValue = function(key, defaultValue) {
+                return localStorage.getItem('enscriber_' + key) || defaultValue;
+            };
+            window.GM_deleteValue = function(key) {
+                localStorage.removeItem('enscriber_' + key);
+            };
+            window.GM_listValues = function() {
+                const keys = [];
+                for (let i = 0; i < localStorage.length; i++) {
+                    const key = localStorage.key(i);
+                    if (key.startsWith('enscriber_')) {
+                        keys.push(key.substring(10));
+                    }
+                }
+                return keys;
+            };
+            window.GM_addStyle = function(css) {
+                const style = document.createElement('style');
+                style.textContent = css;
+                document.head.appendChild(style);
+            };
+
+            // Load the Enscriber script content here
+            // For testing, we'll include the core functionality inline
+            
+            const ENSCRIBER_CONFIG = {
+                version: '1.0.0',
+                namespace: 'enscriber',
+                ui: {
+                    panelId: 'enscriber-floating-panel',
+                    shadowRootId: 'enscriber-shadow-root',
+                    minWidth: 300,
+                    minHeight: 400,
+                    maxWidth: 800,
+                    maxHeight: 600,
+                    defaultWidth: 400,
+                    defaultHeight: 500,
+                    zIndex: 999999
+                },
+                storage: {
+                    prefix: 'enscriber_',
+                    sessionKey: 'current_session',
+                    settingsKey: 'settings'
+                },
+                modes: {
+                    INACTIVE: 'inactive',
+                    AUTO_RECORDING: 'auto_recording',
+                    MANUAL_SELECTION: 'manual_selection',
+                    PAUSED: 'paused'
+                }
+            };
+
+            console.log('Enscriber test environment initialized');
+            console.log('Note: This is a simplified test version. The full userscript should be installed via Tampermonkey for complete functionality.');
+            
+            // Add a simple test button to simulate the panel
+            const testButton = document.createElement('button');
+            testButton.textContent = 'Test Enscriber (Simplified)';
+            testButton.style.cssText = `
+                position: fixed;
+                top: 20px;
+                right: 20px;
+                z-index: 999999;
+                background: #667eea;
+                color: white;
+                border: none;
+                padding: 10px 15px;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 12px;
+            `;
+            testButton.onclick = function() {
+                alert('Enscriber test button clicked!\n\nTo test the full functionality:\n1. Install Tampermonkey browser extension\n2. Install the enscriber.user.js script\n3. Reload this page');
+            };
+            document.body.appendChild(testButton);
+            
+        })();
+    </script>
+</body>
+</html>
