@@ -828,7 +828,35 @@
         isExcludedElement(element) {
             if (!element) return true;
             
-            // Check against exclude selectors
+            // Check if element is part of Enscriber UI (including Shadow DOM)
+            let currentElement = element;
+            while (currentElement) {
+                // Check if element has Enscriber-related IDs or classes
+                if (currentElement.id && currentElement.id.includes('enscriber')) {
+                    return true;
+                }
+                if (currentElement.className && typeof currentElement.className === 'string' &&
+                    currentElement.className.includes('enscriber')) {
+                    return true;
+                }
+                
+                // Check if we're inside the Enscriber floating panel
+                if (currentElement.id === 'enscriber-floating-panel') {
+                    return true;
+                }
+                
+                // Check if we're in a shadow root that belongs to Enscriber
+                if (currentElement.getRootNode && currentElement.getRootNode() !== document) {
+                    const root = currentElement.getRootNode();
+                    if (root.host && root.host.id === 'enscriber-floating-panel') {
+                        return true;
+                    }
+                }
+                
+                currentElement = currentElement.parentElement || currentElement.parentNode;
+            }
+            
+            // Check against exclude selectors as fallback
             for (const selector of this.excludeSelectors) {
                 try {
                     if (element.matches && element.matches(selector)) {
@@ -985,6 +1013,7 @@
             this.stateManager = stateManager;
             this.elementSelector = elementSelector;
             this.highlighter = highlighter;
+            this.networkMonitor = new NetworkRequestMonitor(stateManager);
             this.recordingMode = ENSCRIBER_CONFIG.modes.INACTIVE;
             this.isRecording = false;
             this.recordedActions = [];
@@ -1036,6 +1065,7 @@
         startManualSelection() {
             this.initializeSession();
             this.elementSelector.enableSelectionMode();
+            this.networkMonitor.startMonitoring();
             this.isRecording = true;
         }
 
@@ -1047,6 +1077,7 @@
             // For now, just enable selection mode
             // Full auto recording will be implemented in future phases
             this.elementSelector.enableSelectionMode();
+            this.networkMonitor.startMonitoring();
             this.isRecording = true;
         }
 
@@ -1055,6 +1086,7 @@
          */
         pauseRecording() {
             this.elementSelector.disableSelectionMode();
+            this.networkMonitor.stopMonitoring();
             // Keep isRecording true but disable interactions
         }
 
@@ -1063,9 +1095,10 @@
          */
         stopRecording() {
             this.elementSelector.disableSelectionMode();
+            this.networkMonitor.stopMonitoring();
             this.isRecording = false;
             
-            // Save current session if it exists
+            // Save current session if it exists, but keep it in state for persistence
             const currentState = this.stateManager.getState();
             if (currentState.currentSession) {
                 const sessionData = {
@@ -1081,6 +1114,11 @@
                 } catch (error) {
                     console.error('Enscriber: Failed to save session:', error);
                 }
+                
+                // Keep the session in state so actions persist until manually cleared
+                this.stateManager.setState({
+                    currentSession: sessionData
+                });
             }
         }
 
@@ -1169,7 +1207,380 @@
          */
         destroy() {
             this.stopRecording();
+            if (this.networkMonitor) {
+                this.networkMonitor.destroy();
+            }
             this.recordedActions = [];
+        }
+    }
+
+    // ============================================================================
+    // NETWORK REQUEST MONITORING
+    // ============================================================================
+
+    /**
+     * Monitors network requests and provides selective addition to action list
+     */
+    class NetworkRequestMonitor {
+        constructor(stateManager) {
+            this.stateManager = stateManager;
+            this.isMonitoring = false;
+            this.capturedRequests = [];
+            this.originalFetch = null;
+            this.originalXHROpen = null;
+            this.originalXHRSend = null;
+            
+            // Request filtering options
+            this.filters = {
+                methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
+                excludePatterns: [
+                    /\.(css|js|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf)$/i,
+                    /google-analytics/i,
+                    /googletagmanager/i,
+                    /facebook\.net/i,
+                    /doubleclick\.net/i
+                ]
+            };
+        }
+
+        /**
+         * Start monitoring network requests
+         */
+        startMonitoring() {
+            if (this.isMonitoring) return;
+            
+            this.isMonitoring = true;
+            this.capturedRequests = [];
+            
+            // Intercept fetch API
+            this.interceptFetch();
+            
+            // Intercept XMLHttpRequest
+            this.interceptXHR();
+            
+            console.log('Enscriber: Network request monitoring started');
+        }
+
+        /**
+         * Stop monitoring network requests
+         */
+        stopMonitoring() {
+            if (!this.isMonitoring) return;
+            
+            this.isMonitoring = false;
+            
+            // Restore original fetch
+            if (this.originalFetch) {
+                window.fetch = this.originalFetch;
+                this.originalFetch = null;
+            }
+            
+            // Restore original XMLHttpRequest
+            if (this.originalXHROpen && this.originalXHRSend) {
+                XMLHttpRequest.prototype.open = this.originalXHROpen;
+                XMLHttpRequest.prototype.send = this.originalXHRSend;
+                this.originalXHROpen = null;
+                this.originalXHRSend = null;
+            }
+            
+            console.log('Enscriber: Network request monitoring stopped');
+        }
+
+        /**
+         * Intercept fetch API calls
+         */
+        interceptFetch() {
+            this.originalFetch = window.fetch;
+            const self = this;
+            
+            window.fetch = function(input, init = {}) {
+                const url = typeof input === 'string' ? input : input.url;
+                const method = init.method || 'GET';
+                const headers = init.headers || {};
+                const body = init.body;
+                
+                const requestData = {
+                    id: EnscribeUtils.generateId(),
+                    timestamp: Date.now(),
+                    method: method.toUpperCase(),
+                    url: url,
+                    headers: self.normalizeHeaders(headers),
+                    body: self.serializeBody(body),
+                    type: 'fetch'
+                };
+                
+                // Call original fetch and capture response
+                const fetchPromise = self.originalFetch.call(this, input, init);
+                
+                fetchPromise.then(response => {
+                    requestData.status = response.status;
+                    requestData.statusText = response.statusText;
+                    requestData.responseHeaders = self.extractResponseHeaders(response);
+                    
+                    if (self.shouldCaptureRequest(requestData)) {
+                        self.capturedRequests.push(requestData);
+                        self.notifyRequestCaptured(requestData);
+                    }
+                }).catch(error => {
+                    requestData.error = error.message;
+                    
+                    if (self.shouldCaptureRequest(requestData)) {
+                        self.capturedRequests.push(requestData);
+                        self.notifyRequestCaptured(requestData);
+                    }
+                });
+                
+                return fetchPromise;
+            };
+        }
+
+        /**
+         * Intercept XMLHttpRequest calls
+         */
+        interceptXHR() {
+            this.originalXHROpen = XMLHttpRequest.prototype.open;
+            this.originalXHRSend = XMLHttpRequest.prototype.send;
+            const self = this;
+            
+            XMLHttpRequest.prototype.open = function(method, url, async, user, password) {
+                this._enscriber_method = method.toUpperCase();
+                this._enscriber_url = url;
+                this._enscriber_timestamp = Date.now();
+                
+                return self.originalXHROpen.call(this, method, url, async, user, password);
+            };
+            
+            XMLHttpRequest.prototype.send = function(body) {
+                const xhr = this;
+                const requestData = {
+                    id: EnscribeUtils.generateId(),
+                    timestamp: xhr._enscriber_timestamp || Date.now(),
+                    method: xhr._enscriber_method || 'GET',
+                    url: xhr._enscriber_url || '',
+                    headers: {},
+                    body: self.serializeBody(body),
+                    type: 'xhr'
+                };
+                
+                // Capture request headers (limited access)
+                try {
+                    if (xhr.getAllResponseHeaders) {
+                        // We can't get request headers easily, but we'll capture what we can
+                        requestData.headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+                    }
+                } catch (e) {
+                    // Ignore header access errors
+                }
+                
+                // Set up response handler
+                const originalOnReadyStateChange = xhr.onreadystatechange;
+                xhr.onreadystatechange = function() {
+                    if (xhr.readyState === 4) {
+                        requestData.status = xhr.status;
+                        requestData.statusText = xhr.statusText;
+                        
+                        try {
+                            const responseHeaders = xhr.getAllResponseHeaders();
+                            requestData.responseHeaders = self.parseResponseHeaders(responseHeaders);
+                        } catch (e) {
+                            requestData.responseHeaders = {};
+                        }
+                        
+                        if (self.shouldCaptureRequest(requestData)) {
+                            self.capturedRequests.push(requestData);
+                            self.notifyRequestCaptured(requestData);
+                        }
+                    }
+                    
+                    if (originalOnReadyStateChange) {
+                        originalOnReadyStateChange.call(this);
+                    }
+                };
+                
+                return self.originalXHRSend.call(this, body);
+            };
+        }
+
+        /**
+         * Normalize headers to a consistent format
+         */
+        normalizeHeaders(headers) {
+            const normalized = {};
+            
+            if (headers instanceof Headers) {
+                for (const [key, value] of headers.entries()) {
+                    normalized[key] = value;
+                }
+            } else if (typeof headers === 'object' && headers !== null) {
+                Object.assign(normalized, headers);
+            }
+            
+            return normalized;
+        }
+
+        /**
+         * Extract response headers from fetch Response
+         */
+        extractResponseHeaders(response) {
+            const headers = {};
+            
+            try {
+                for (const [key, value] of response.headers.entries()) {
+                    headers[key] = value;
+                }
+            } catch (e) {
+                // Ignore header access errors
+            }
+            
+            return headers;
+        }
+
+        /**
+         * Parse response headers from XHR string format
+         */
+        parseResponseHeaders(headerString) {
+            const headers = {};
+            
+            if (headerString) {
+                headerString.split('\r\n').forEach(line => {
+                    const parts = line.split(': ');
+                    if (parts.length === 2) {
+                        headers[parts[0]] = parts[1];
+                    }
+                });
+            }
+            
+            return headers;
+        }
+
+        /**
+         * Serialize request body for storage
+         */
+        serializeBody(body) {
+            if (!body) return null;
+            
+            if (typeof body === 'string') {
+                return body;
+            }
+            
+            if (body instanceof FormData) {
+                const formObject = {};
+                for (const [key, value] of body.entries()) {
+                    formObject[key] = value;
+                }
+                return JSON.stringify(formObject);
+            }
+            
+            if (body instanceof URLSearchParams) {
+                return body.toString();
+            }
+            
+            try {
+                return JSON.stringify(body);
+            } catch (e) {
+                return '[Unserializable Body]';
+            }
+        }
+
+        /**
+         * Check if request should be captured based on filters
+         */
+        shouldCaptureRequest(requestData) {
+            // Check method filter
+            if (!this.filters.methods.includes(requestData.method)) {
+                return false;
+            }
+            
+            // Check exclude patterns
+            for (const pattern of this.filters.excludePatterns) {
+                if (pattern.test(requestData.url)) {
+                    return false;
+                }
+            }
+            
+            // Don't capture requests to the same origin that are likely internal
+            try {
+                const url = new URL(requestData.url, window.location.href);
+                if (url.pathname.includes('enscriber')) {
+                    return false;
+                }
+            } catch (e) {
+                // Invalid URL, skip
+                return false;
+            }
+            
+            return true;
+        }
+
+        /**
+         * Notify that a request was captured
+         */
+        notifyRequestCaptured(requestData) {
+            // Update state to trigger UI refresh
+            const currentState = this.stateManager.getState();
+            this.stateManager.setState({
+                networkRequests: [...(currentState.networkRequests || []), requestData]
+            });
+        }
+
+        /**
+         * Get all captured requests
+         */
+        getCapturedRequests() {
+            return [...this.capturedRequests];
+        }
+
+        /**
+         * Clear captured requests
+         */
+        clearCapturedRequests() {
+            this.capturedRequests = [];
+            this.stateManager.setState({
+                networkRequests: []
+            });
+        }
+
+        /**
+         * Add a network request to the action list
+         */
+        addRequestToActions(requestData, actionType = 'waitForResponse') {
+            const currentState = this.stateManager.getState();
+            const currentSession = currentState.currentSession || { actions: [] };
+            
+            const actionRecord = {
+                id: EnscribeUtils.generateId(),
+                timestamp: Date.now(),
+                type: actionType,
+                networkRequest: requestData,
+                notes: `${requestData.method} ${requestData.url}`,
+                context: {
+                    url: window.location.href,
+                    title: document.title,
+                    viewport: {
+                        width: window.innerWidth,
+                        height: window.innerHeight
+                    }
+                }
+            };
+            
+            const updatedActions = [...currentSession.actions, actionRecord];
+            
+            this.stateManager.setState({
+                currentSession: {
+                    ...currentSession,
+                    actions: updatedActions
+                }
+            });
+            
+            console.log('Enscriber: Network request added to actions:', requestData);
+        }
+
+        /**
+         * Clean up resources
+         */
+        destroy() {
+            this.stopMonitoring();
+            this.capturedRequests = [];
         }
     }
 
@@ -2103,6 +2514,10 @@
             const actionSection = this.createSection('Recorded Actions', this.createActionListContent());
             content.appendChild(actionSection);
             
+            // Network Requests Section
+            const networkSection = this.createSection('Network Requests', this.createNetworkRequestsContent());
+            content.appendChild(networkSection);
+            
             // Notes Section
             const notesSection = this.createSection('Notes', this.createNotesContent());
             content.appendChild(notesSection);
@@ -2224,6 +2639,29 @@
         }
 
         /**
+         * Create network requests content
+         */
+        createNetworkRequestsContent() {
+            const container = document.createElement('div');
+            const list = document.createElement('ul');
+            list.className = 'enscriber-network-list';
+            list.style.cssText = `
+                list-style: none;
+                margin: 0;
+                padding: 0;
+            `;
+            
+            const emptyMessage = document.createElement('div');
+            emptyMessage.className = 'enscriber-text-muted enscriber-text-small';
+            emptyMessage.textContent = 'No network requests captured yet';
+            
+            container.appendChild(emptyMessage);
+            container.appendChild(list);
+            
+            return container;
+        }
+
+        /**
          * Create footer section
          */
         createFooter() {
@@ -2248,6 +2686,12 @@
             const rightSection = document.createElement('div');
             rightSection.className = 'enscriber-footer-right';
             
+            const clearBtn = document.createElement('button');
+            clearBtn.className = 'enscriber-btn-secondary';
+            clearBtn.textContent = 'Clear';
+            clearBtn.title = 'Clear recorded actions';
+            clearBtn.addEventListener('click', () => this.handleClearActions());
+            
             const exportBtn = document.createElement('button');
             exportBtn.className = 'enscriber-btn-secondary';
             exportBtn.textContent = 'Export';
@@ -2259,6 +2703,7 @@
             settingsBtn.title = 'Settings';
             settingsBtn.addEventListener('click', () => this.showSettings());
             
+            rightSection.appendChild(clearBtn);
             rightSection.appendChild(exportBtn);
             rightSection.appendChild(settingsBtn);
             
@@ -2330,6 +2775,11 @@
                 // Check if currentSession has changed
                 if (newState.currentSession !== prevState.currentSession) {
                     this.updateActionList(newState, prevState);
+                }
+                
+                // Check if networkRequests have changed
+                if (newState.networkRequests !== prevState.networkRequests) {
+                    this.updateNetworkRequestsList(newState, prevState);
                 }
             });
         }
@@ -2536,7 +2986,23 @@
          */
         handleStartRecording() {
             if (this.recordingEngine) {
-                this.recordingEngine.toggleRecording();
+                const currentState = this.stateManager.getState();
+                
+                // Check current mode and toggle appropriately
+                if (currentState.mode === ENSCRIBER_CONFIG.modes.INACTIVE) {
+                    // Start recording
+                    this.recordingEngine.toggleRecording();
+                } else if (currentState.mode === ENSCRIBER_CONFIG.modes.MANUAL_SELECTION ||
+                          currentState.mode === ENSCRIBER_CONFIG.modes.AUTO_RECORDING) {
+                    // Stop recording
+                    this.recordingEngine.toggleRecording();
+                } else if (currentState.mode === ENSCRIBER_CONFIG.modes.PAUSED) {
+                    // Resume recording
+                    this.stateManager.setState({
+                        mode: ENSCRIBER_CONFIG.modes.MANUAL_SELECTION,
+                        isPaused: false
+                    });
+                }
             }
         }
 
@@ -2618,6 +3084,25 @@
                         newState.currentSession.actions.forEach((action, index) => {
                             const listItem = document.createElement('li');
                             listItem.className = 'enscriber-action-item';
+                            listItem.style.cssText = `
+                                display: flex;
+                                flex-direction: column;
+                                gap: 8px;
+                                padding: 12px 0;
+                                border-bottom: 1px solid #f1f5f9;
+                            `;
+                            
+                            // Main action info row
+                            const actionRow = document.createElement('div');
+                            actionRow.style.cssText = `
+                                display: flex;
+                                justify-content: space-between;
+                                align-items: flex-start;
+                                gap: 8px;
+                            `;
+                            
+                            const actionContent = document.createElement('div');
+                            actionContent.style.flex = '1';
                             
                             const actionType = document.createElement('div');
                             actionType.className = 'enscriber-action-type';
@@ -2639,8 +3124,85 @@
                             
                             actionElement.textContent = elementDescription;
                             
-                            listItem.appendChild(actionType);
-                            listItem.appendChild(actionElement);
+                            actionContent.appendChild(actionType);
+                            actionContent.appendChild(actionElement);
+                            
+                            // Add action controls
+                            const actionControls = document.createElement('div');
+                            actionControls.style.cssText = `
+                                display: flex;
+                                gap: 4px;
+                                flex-shrink: 0;
+                            `;
+                            
+                            const editBtn = document.createElement('button');
+                            editBtn.textContent = '✏';
+                            editBtn.title = 'Edit action';
+                            editBtn.style.cssText = `
+                                background: #f0f9f4;
+                                border: 1px solid #4a7c59;
+                                color: #2d5016;
+                                width: 20px;
+                                height: 20px;
+                                border-radius: 3px;
+                                cursor: pointer;
+                                font-size: 10px;
+                                display: flex;
+                                align-items: center;
+                                justify-content: center;
+                            `;
+                            editBtn.addEventListener('click', (e) => {
+                                e.stopPropagation();
+                                this.editAction(index);
+                            });
+                            
+                            const deleteBtn = document.createElement('button');
+                            deleteBtn.textContent = '×';
+                            deleteBtn.title = 'Delete action';
+                            deleteBtn.style.cssText = `
+                                background: #fef2f2;
+                                border: 1px solid #dc2626;
+                                color: #dc2626;
+                                width: 20px;
+                                height: 20px;
+                                border-radius: 3px;
+                                cursor: pointer;
+                                font-size: 12px;
+                                display: flex;
+                                align-items: center;
+                                justify-content: center;
+                            `;
+                            deleteBtn.addEventListener('click', (e) => {
+                                e.stopPropagation();
+                                this.deleteAction(index);
+                            });
+                            
+                            actionControls.appendChild(editBtn);
+                            actionControls.appendChild(deleteBtn);
+                            
+                            actionRow.appendChild(actionContent);
+                            actionRow.appendChild(actionControls);
+                            
+                            // Add notes section if notes exist
+                            if (action.notes && action.notes.trim()) {
+                                const notesDiv = document.createElement('div');
+                                notesDiv.style.cssText = `
+                                    background: #f8fafc;
+                                    border: 1px solid #e2e8f0;
+                                    border-radius: 4px;
+                                    padding: 6px 8px;
+                                    font-size: 11px;
+                                    color: #64748b;
+                                    margin-top: 4px;
+                                `;
+                                notesDiv.innerHTML = `<strong>Notes:</strong> ${action.notes}`;
+                                
+                                listItem.appendChild(actionRow);
+                                listItem.appendChild(notesDiv);
+                            } else {
+                                listItem.appendChild(actionRow);
+                            }
+                            
                             list.appendChild(listItem);
                         });
                         
@@ -2656,6 +3218,455 @@
                         list.innerHTML = '';
                     }
                 }
+            }
+        }
+
+        /**
+         * Update network requests list display
+         */
+        updateNetworkRequestsList(newState, prevState) {
+            const networkSection = this.shadowRoot.querySelector('.enscriber-section:nth-child(5) .enscriber-section-content');
+            
+            if (networkSection) {
+                const list = networkSection.querySelector('.enscriber-network-list');
+                const emptyMessage = networkSection.querySelector('.enscriber-text-muted');
+                
+                if (newState.networkRequests && newState.networkRequests.length > 0) {
+                    // Hide empty message and show list
+                    if (emptyMessage) emptyMessage.style.display = 'none';
+                    if (list) list.style.display = 'block';
+                    
+                    // Clear and populate list
+                    if (list) {
+                        list.innerHTML = '';
+                        newState.networkRequests.forEach((request, index) => {
+                            const listItem = document.createElement('li');
+                            listItem.style.cssText = `
+                                display: flex;
+                                flex-direction: column;
+                                gap: 6px;
+                                padding: 10px 0;
+                                border-bottom: 1px solid #f1f5f9;
+                                font-size: 11px;
+                            `;
+                            
+                            // Request info row
+                            const requestRow = document.createElement('div');
+                            requestRow.style.cssText = `
+                                display: flex;
+                                justify-content: space-between;
+                                align-items: flex-start;
+                                gap: 8px;
+                            `;
+                            
+                            const requestContent = document.createElement('div');
+                            requestContent.style.flex = '1';
+                            
+                            const methodAndStatus = document.createElement('div');
+                            methodAndStatus.style.cssText = `
+                                display: flex;
+                                align-items: center;
+                                gap: 8px;
+                                margin-bottom: 2px;
+                            `;
+                            
+                            const methodBadge = document.createElement('span');
+                            methodBadge.textContent = request.method;
+                            methodBadge.style.cssText = `
+                                background: ${this.getMethodColor(request.method)};
+                                color: white;
+                                padding: 2px 6px;
+                                border-radius: 3px;
+                                font-size: 9px;
+                                font-weight: 500;
+                            `;
+                            
+                            const statusBadge = document.createElement('span');
+                            statusBadge.textContent = request.status || 'Pending';
+                            statusBadge.style.cssText = `
+                                background: ${this.getStatusColor(request.status)};
+                                color: white;
+                                padding: 2px 6px;
+                                border-radius: 3px;
+                                font-size: 9px;
+                                font-weight: 500;
+                            `;
+                            
+                            methodAndStatus.appendChild(methodBadge);
+                            methodAndStatus.appendChild(statusBadge);
+                            
+                            const urlDiv = document.createElement('div');
+                            urlDiv.style.cssText = `
+                                color: #64748b;
+                                font-size: 10px;
+                                word-break: break-all;
+                                line-height: 1.3;
+                            `;
+                            
+                            // Truncate long URLs
+                            const url = request.url;
+                            const maxLength = 60;
+                            urlDiv.textContent = url.length > maxLength ? url.substring(0, maxLength) + '...' : url;
+                            urlDiv.title = url;
+                            
+                            requestContent.appendChild(methodAndStatus);
+                            requestContent.appendChild(urlDiv);
+                            
+                            // Add to actions button
+                            const addButton = document.createElement('button');
+                            addButton.textContent = '+';
+                            addButton.title = 'Add to actions';
+                            addButton.style.cssText = `
+                                background: #f0f9f4;
+                                border: 1px solid #4a7c59;
+                                color: #2d5016;
+                                width: 24px;
+                                height: 24px;
+                                border-radius: 4px;
+                                cursor: pointer;
+                                font-size: 12px;
+                                font-weight: bold;
+                                display: flex;
+                                align-items: center;
+                                justify-content: center;
+                                flex-shrink: 0;
+                            `;
+                            
+                            addButton.addEventListener('click', (e) => {
+                                e.stopPropagation();
+                                this.addNetworkRequestToActions(request);
+                            });
+                            
+                            requestRow.appendChild(requestContent);
+                            requestRow.appendChild(addButton);
+                            listItem.appendChild(requestRow);
+                            
+                            list.appendChild(listItem);
+                        });
+                        
+                        // Auto-scroll to the latest request
+                        const networkSectionContent = networkSection;
+                        networkSectionContent.scrollTop = networkSectionContent.scrollHeight;
+                    }
+                } else {
+                    // Show empty message and hide list
+                    if (emptyMessage) emptyMessage.style.display = 'block';
+                    if (list) {
+                        list.style.display = 'none';
+                        list.innerHTML = '';
+                    }
+                }
+            }
+        }
+
+        /**
+         * Get color for HTTP method badge
+         */
+        getMethodColor(method) {
+            const colors = {
+                'GET': '#10b981',
+                'POST': '#3b82f6',
+                'PUT': '#f59e0b',
+                'DELETE': '#ef4444',
+                'PATCH': '#8b5cf6',
+                'HEAD': '#6b7280',
+                'OPTIONS': '#6b7280'
+            };
+            return colors[method] || '#6b7280';
+        }
+
+        /**
+         * Get color for status code badge
+         */
+        getStatusColor(status) {
+            if (!status) return '#6b7280';
+            
+            if (status >= 200 && status < 300) return '#10b981';
+            if (status >= 300 && status < 400) return '#f59e0b';
+            if (status >= 400 && status < 500) return '#ef4444';
+            if (status >= 500) return '#dc2626';
+            return '#6b7280';
+        }
+
+        /**
+         * Add network request to actions list
+         */
+        addNetworkRequestToActions(request) {
+            if (this.recordingEngine && this.recordingEngine.networkMonitor) {
+                // Show action type selection dialog
+                this.showNetworkActionDialog(request);
+            }
+        }
+
+        /**
+         * Show dialog to select network action type
+         */
+        showNetworkActionDialog(request) {
+            const dialog = document.createElement('div');
+            dialog.style.cssText = `
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: rgba(0, 0, 0, 0.5);
+                z-index: ${ENSCRIBER_CONFIG.ui.zIndex + 1};
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            `;
+            
+            const content = document.createElement('div');
+            content.style.cssText = `
+                background: white;
+                border-radius: 8px;
+                padding: 20px;
+                width: 400px;
+                box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+            `;
+            
+            content.innerHTML = `
+                <h3 style="margin: 0 0 15px 0; color: #333;">Add Network Request to Actions</h3>
+                <div style="margin-bottom: 15px; padding: 10px; background: #f8fafc; border-radius: 4px; font-size: 12px;">
+                    <div><strong>${request.method}</strong> ${request.url}</div>
+                    <div style="color: #64748b; margin-top: 4px;">Status: ${request.status || 'Pending'}</div>
+                </div>
+                <div style="margin-bottom: 15px;">
+                    <label style="display: block; margin-bottom: 5px; font-weight: 500;">Action Type:</label>
+                    <select id="network-action-type" style="width: 100%; padding: 5px; border: 1px solid #ddd; border-radius: 4px;">
+                        <option value="waitForResponse">Wait for Response</option>
+                        <option value="route">Route/Mock Request</option>
+                        <option value="waitForRequest">Wait for Request</option>
+                    </select>
+                </div>
+                <div style="margin-bottom: 20px;">
+                    <label style="display: block; margin-bottom: 5px; font-weight: 500;">Notes:</label>
+                    <textarea id="network-action-notes" style="width: 100%; height: 60px; padding: 5px; border: 1px solid #ddd; border-radius: 4px; resize: vertical;" placeholder="Add notes for this network action..."></textarea>
+                </div>
+                <div style="text-align: right;">
+                    <button id="add-network-action" style="
+                        background: #4a7c59;
+                        color: white;
+                        border: none;
+                        padding: 8px 16px;
+                        border-radius: 4px;
+                        margin-right: 10px;
+                        cursor: pointer;
+                    ">Add to Actions</button>
+                    <button id="cancel-network-action" style="
+                        background: #e2e8f0;
+                        color: #4a5568;
+                        border: none;
+                        padding: 8px 16px;
+                        border-radius: 4px;
+                        cursor: pointer;
+                    ">Cancel</button>
+                </div>
+            `;
+            
+            dialog.appendChild(content);
+            document.body.appendChild(dialog);
+            
+            // Add event listeners
+            content.querySelector('#add-network-action').addEventListener('click', () => {
+                const actionType = content.querySelector('#network-action-type').value;
+                const notes = content.querySelector('#network-action-notes').value;
+                
+                // Add the request to actions with custom notes
+                this.recordingEngine.networkMonitor.addRequestToActions(request, actionType);
+                
+                // Update the action notes if provided
+                if (notes.trim()) {
+                    const state = this.stateManager.getState();
+                    if (state.currentSession && state.currentSession.actions.length > 0) {
+                        const lastAction = state.currentSession.actions[state.currentSession.actions.length - 1];
+                        lastAction.notes = notes;
+                        
+                        this.stateManager.setState({
+                            currentSession: {
+                                ...state.currentSession,
+                                actions: [...state.currentSession.actions]
+                            }
+                        });
+                    }
+                }
+                
+                document.body.removeChild(dialog);
+            });
+            
+            content.querySelector('#cancel-network-action').addEventListener('click', () => {
+                document.body.removeChild(dialog);
+            });
+            
+            dialog.addEventListener('click', (e) => {
+                if (e.target === dialog) {
+                    document.body.removeChild(dialog);
+                }
+            });
+        }
+
+        /**
+         * Handle clear actions functionality
+         */
+        handleClearActions() {
+            const state = this.stateManager.getState();
+            if (!state.currentSession || !state.currentSession.actions || state.currentSession.actions.length === 0) {
+                alert('No actions to clear.');
+                return;
+            }
+            
+            if (confirm(`Are you sure you want to clear all ${state.currentSession.actions.length} recorded actions? This cannot be undone.`)) {
+                // Clear actions from current session
+                this.stateManager.setState({
+                    currentSession: {
+                        ...state.currentSession,
+                        actions: []
+                    }
+                });
+                
+                // Also clear network requests
+                this.stateManager.setState({
+                    networkRequests: []
+                });
+                
+                // Clear from network monitor
+                if (this.recordingEngine && this.recordingEngine.networkMonitor) {
+                    this.recordingEngine.networkMonitor.clearCapturedRequests();
+                }
+                
+                console.log('Enscriber: All actions and network requests cleared');
+            }
+        }
+
+        /**
+         * Edit an action in the list
+         */
+        editAction(actionIndex) {
+            const state = this.stateManager.getState();
+            if (!state.currentSession || !state.currentSession.actions || actionIndex >= state.currentSession.actions.length) {
+                return;
+            }
+            
+            const action = state.currentSession.actions[actionIndex];
+            
+            const dialog = document.createElement('div');
+            dialog.style.cssText = `
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: rgba(0, 0, 0, 0.5);
+                z-index: ${ENSCRIBER_CONFIG.ui.zIndex + 1};
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            `;
+            
+            const content = document.createElement('div');
+            content.style.cssText = `
+                background: white;
+                border-radius: 8px;
+                padding: 20px;
+                width: 400px;
+                box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+            `;
+            
+            content.innerHTML = `
+                <h3 style="margin: 0 0 20px 0; color: #333;">Edit Action ${actionIndex + 1}</h3>
+                <div style="margin-bottom: 15px;">
+                    <label style="display: block; margin-bottom: 5px; font-weight: 500;">Action Type:</label>
+                    <select id="action-type" style="width: 100%; padding: 5px; border: 1px solid #ddd; border-radius: 4px;">
+                        <option value="click" ${action.type === 'click' ? 'selected' : ''}>Click</option>
+                        <option value="input" ${action.type === 'input' ? 'selected' : ''}>Input</option>
+                        <option value="hover" ${action.type === 'hover' ? 'selected' : ''}>Hover</option>
+                        <option value="check" ${action.type === 'check' ? 'selected' : ''}>Check</option>
+                        <option value="select" ${action.type === 'select' ? 'selected' : ''}>Select</option>
+                    </select>
+                </div>
+                <div style="margin-bottom: 15px;">
+                    <label style="display: block; margin-bottom: 5px; font-weight: 500;">Value:</label>
+                    <input type="text" id="action-value" value="${action.value || ''}" style="width: 100%; padding: 5px; border: 1px solid #ddd; border-radius: 4px;">
+                </div>
+                <div style="margin-bottom: 20px;">
+                    <label style="display: block; margin-bottom: 5px; font-weight: 500;">Notes:</label>
+                    <textarea id="action-notes" style="width: 100%; height: 60px; padding: 5px; border: 1px solid #ddd; border-radius: 4px; resize: vertical;" placeholder="Add notes for this action...">${action.notes || ''}</textarea>
+                </div>
+                <div style="text-align: right;">
+                    <button id="save-action" style="
+                        background: #4a7c59;
+                        color: white;
+                        border: none;
+                        padding: 8px 16px;
+                        border-radius: 4px;
+                        margin-right: 10px;
+                        cursor: pointer;
+                    ">Save</button>
+                    <button id="cancel-action" style="
+                        background: #e2e8f0;
+                        color: #4a5568;
+                        border: none;
+                        padding: 8px 16px;
+                        border-radius: 4px;
+                        cursor: pointer;
+                    ">Cancel</button>
+                </div>
+            `;
+            
+            dialog.appendChild(content);
+            document.body.appendChild(dialog);
+            
+            // Add event listeners
+            content.querySelector('#save-action').addEventListener('click', () => {
+                const updatedAction = {
+                    ...action,
+                    type: content.querySelector('#action-type').value,
+                    value: content.querySelector('#action-value').value,
+                    notes: content.querySelector('#action-notes').value
+                };
+                
+                const updatedActions = [...state.currentSession.actions];
+                updatedActions[actionIndex] = updatedAction;
+                
+                this.stateManager.setState({
+                    currentSession: {
+                        ...state.currentSession,
+                        actions: updatedActions
+                    }
+                });
+                
+                document.body.removeChild(dialog);
+            });
+            
+            content.querySelector('#cancel-action').addEventListener('click', () => {
+                document.body.removeChild(dialog);
+            });
+            
+            dialog.addEventListener('click', (e) => {
+                if (e.target === dialog) {
+                    document.body.removeChild(dialog);
+                }
+            });
+        }
+
+        /**
+         * Delete an action from the list
+         */
+        deleteAction(actionIndex) {
+            const state = this.stateManager.getState();
+            if (!state.currentSession || !state.currentSession.actions || actionIndex >= state.currentSession.actions.length) {
+                return;
+            }
+            
+            if (confirm(`Are you sure you want to delete action ${actionIndex + 1}?`)) {
+                const updatedActions = state.currentSession.actions.filter((_, index) => index !== actionIndex);
+                
+                this.stateManager.setState({
+                    currentSession: {
+                        ...state.currentSession,
+                        actions: updatedActions
+                    }
+                });
             }
         }
 
@@ -2720,38 +3731,83 @@
             code += `  await page.goto('${session.url}');\n\n`;
             
             actions.forEach((action, index) => {
-                code += `  // Action ${index + 1}: ${action.type} on ${action.element.tagName}`;
-                if (action.element.id) code += `#${action.element.id}`;
-                if (action.element.className) code += `.${action.element.className.split(' ')[0]}`;
-                code += `\n`;
-                
-                // Generate selector priority: ID > data-testid > class > text > xpath
-                let selector = '';
-                if (action.element.id) {
-                    selector = `#${action.element.id}`;
-                } else if (action.element.attributes && action.element.attributes['data-testid']) {
-                    selector = `[data-testid="${action.element.attributes['data-testid']}"]`;
-                } else if (action.element.className) {
-                    const firstClass = action.element.className.split(' ')[0];
-                    selector = `.${firstClass}`;
-                } else if (action.element.textContent) {
-                    selector = `text="${action.element.textContent.substring(0, 30)}"`;
-                } else {
-                    selector = action.element.xpath;
-                }
-                
-                switch (action.type) {
-                    case 'click':
-                        code += `  await page.click('${selector}');\n`;
-                        break;
-                    case 'input':
-                        code += `  await page.fill('${selector}', '${action.value || ''}');\n`;
-                        break;
-                    case 'hover':
-                        code += `  await page.hover('${selector}');\n`;
-                        break;
-                    default:
-                        code += `  await page.click('${selector}');\n`;
+                if (action.networkRequest) {
+                    // Handle network request actions
+                    code += `  // Network Action ${index + 1}: ${action.type} for ${action.networkRequest.method} ${action.networkRequest.url}\n`;
+                    
+                    if (action.notes) {
+                        code += `  // Notes: ${action.notes}\n`;
+                    }
+                    
+                    switch (action.type) {
+                        case 'waitForResponse':
+                            code += `  const response${index} = await page.waitForResponse('${action.networkRequest.url}');\n`;
+                            code += `  expect(response${index}.status()).toBe(${action.networkRequest.status || 200});\n`;
+                            break;
+                        case 'waitForRequest':
+                            code += `  const request${index} = await page.waitForRequest('${action.networkRequest.url}');\n`;
+                            code += `  expect(request${index}.method()).toBe('${action.networkRequest.method}');\n`;
+                            break;
+                        case 'route':
+                            code += `  // Mock/route the request\n`;
+                            code += `  await page.route('${action.networkRequest.url}', route => {\n`;
+                            code += `    route.fulfill({\n`;
+                            code += `      status: ${action.networkRequest.status || 200},\n`;
+                            code += `      contentType: 'application/json',\n`;
+                            code += `      body: JSON.stringify({ /* mock response data */ })\n`;
+                            code += `    });\n`;
+                            code += `  });\n`;
+                            break;
+                    }
+                } else if (action.element) {
+                    // Handle element actions
+                    code += `  // Action ${index + 1}: ${action.type} on ${action.element.tagName}`;
+                    if (action.element.id) code += `#${action.element.id}`;
+                    if (action.element.className) code += `.${action.element.className.split(' ')[0]}`;
+                    code += `\n`;
+                    
+                    if (action.notes) {
+                        code += `  // Notes: ${action.notes}\n`;
+                    }
+                    
+                    // Generate selector priority: ID > data-testid > class > text > xpath
+                    let selector = '';
+                    if (action.element.id) {
+                        selector = `#${action.element.id}`;
+                    } else if (action.element.attributes && action.element.attributes['data-testid']) {
+                        selector = `[data-testid="${action.element.attributes['data-testid']}"]`;
+                    } else if (action.element.className) {
+                        const firstClass = action.element.className.split(' ')[0];
+                        selector = `.${firstClass}`;
+                    } else if (action.element.textContent) {
+                        selector = `text="${action.element.textContent.substring(0, 30)}"`;
+                    } else {
+                        selector = action.element.xpath;
+                    }
+                    
+                    switch (action.type) {
+                        case 'click':
+                            code += `  await page.click('${selector}');\n`;
+                            break;
+                        case 'input':
+                            code += `  await page.fill('${selector}', '${action.value || ''}');\n`;
+                            break;
+                        case 'hover':
+                            code += `  await page.hover('${selector}');\n`;
+                            break;
+                        case 'check':
+                            if (action.value === 'checked') {
+                                code += `  await page.check('${selector}');\n`;
+                            } else {
+                                code += `  await page.uncheck('${selector}');\n`;
+                            }
+                            break;
+                        case 'select':
+                            code += `  await page.selectOption('${selector}', '${action.value || ''}');\n`;
+                            break;
+                        default:
+                            code += `  await page.click('${selector}');\n`;
+                    }
                 }
                 code += `\n`;
             });
